@@ -3,6 +3,8 @@ using Microsoft.WindowsAzure.ResourceStack.Common.Extensions;
 using Microsoft.WindowsAzure.ResourceStack.Common.Manifest.Entities;
 using Newtonsoft.Json;
 using System.Collections.Generic;
+using System.Drawing;
+using System.Net;
 using System.Text.Json;
 using System.Xml;
 
@@ -41,6 +43,11 @@ class Program
         { "South Africa North", "zan" }
     };
 
+    private static List<string> RegionsToCutover = new List<string>()
+    {
+        "West Central US", "East Asia", "Central US", "UK South", "Australia Central"
+    };
+
     private static List<string> DeprecatedRTs = new List<string>()
     {
         "workspaces/analyticsconnectors",
@@ -53,8 +60,184 @@ class Program
 
     public static void Main()
     {
-        UpdateManifestToAddRegionalEndpoints().Wait();
+        UpdateManifestToCutoverToHcapisInRegions().Wait();
+        //UpdateManifestToAddRegionalEndpoints().Wait();
         //UpdateManifestToConsolidateVersions().Wait();
+    }
+
+    private static async Task UpdateManifestToCutoverToHcapisInRegions()
+    {
+        try
+        {
+            // Open the text file using a stream reader.
+            using (StreamReader reader = new StreamReader("prod.json"))
+            {
+                // Read the entire stream asynchronously and await the result.
+                string text = await reader.ReadToEndAsync();
+
+                var options = new JsonSerializerOptions
+                {
+                    ReadCommentHandling = JsonCommentHandling.Skip,
+                    AllowTrailingCommas = true,
+                };
+                ResourceProviderManifest manifest = JsonConvert.DeserializeObject<ResourceProviderManifest>(text, SerializerSettings.SerializerMediaTypeSettings);
+
+                foreach (var rt in manifest.ResourceTypes)
+                {
+                    if (DeprecatedRTs.Contains(rt.Name))
+                    {
+                        // do not add to deprecated resources
+                        continue;
+                    }
+
+                    var endpointsToBeAddedTo = rt.Endpoints.ToList();
+                    int endpointsIndex = 0;
+
+                    foreach (var endpoint in rt.Endpoints)
+                    {
+                        foreach (var region in RegionsToCutover)
+                        {
+                            if (endpoint.RequiredFeatures != null && endpoint.RequiredFeatures.Length == 1 && endpoint.RequiredFeatures.Contains("Microsoft.HealthcareApis/<Put PreProd Feature Flag here>"))
+                            {
+                                // skipping preprod routes since that environment does not exist in AKS
+                                continue;
+                            }
+
+                            int aksEndpointIndex = endpointsToBeAddedTo.IndexOf(e => e.Locations.Contains(region) && e.RequiredFeatures != null && e.RequiredFeatures.Contains("Microsoft.HealthcareApis/<Put AKS Feature Flag here>"));
+
+                            if (aksEndpointIndex < 0)
+                            {
+                                Console.WriteLine($"RT {rt.Name} does not have AKS endpoint for region {region}");
+                                continue;
+                            }
+
+                            // Get any additional feature flags declared on AKS endpoint
+                            var aksFeatureFlagsAsideFromAksFF = endpointsToBeAddedTo[aksEndpointIndex].RequiredFeatures.ToList();
+                            aksFeatureFlagsAsideFromAksFF.Remove("Microsoft.HealthcareApis/<Put AKS Feature Flag here>");
+
+                            if (endpoint.Locations == null || endpoint.Locations.Length == 0 || endpoint.Locations.Contains("") || aksEndpointIndex == endpointsIndex)
+                            {
+                                // no locations specified, or skip the aks endpoint for data collection
+                                continue;
+                            }
+
+                            if (endpoint.Locations.Contains(region))
+                            {
+                                if (endpoint.RequiredFeatures == null || endpoint.RequiredFeatures.Length == 0 || endpoint.RequiredFeatures.All(e => aksFeatureFlagsAsideFromAksFF.Contains(e)))
+                                {
+                                    if (endpoint.ApiVersions != null && endpoint.ApiVersions.Length > 0)
+                                    {
+                                        // Merge api versions
+                                        var existingAksEndpoints = endpointsToBeAddedTo[aksEndpointIndex].ApiVersions;
+                                        var allEndpoints = existingAksEndpoints.Union(endpoint.ApiVersions);
+
+                                        // Update aks endpoint with new api versions
+                                        endpointsToBeAddedTo[aksEndpointIndex].ApiVersions = allEndpoints.ToArray();
+                                    }
+
+                                    // Update endpoint with this location removed
+                                    var endpointLocations = endpoint.Locations.ToList();
+                                    endpointLocations.Remove(region);
+
+                                    // If that was the only region in the endpoint, remove the whole endpoint. Otherwise update endpoint
+                                    if (endpointLocations.Count == 0)
+                                    {
+                                        var endpointatIndex = endpointsToBeAddedTo.ElementAt(endpointsIndex);
+                                        if (endpointatIndex.Locations.Length == 1 && !endpointatIndex.Locations.Contains(region))
+                                        {
+                                            Console.WriteLine("Deleting the endpoint with the wrong locations");
+                                        }
+
+                                        endpointsToBeAddedTo.RemoveAt(endpointsIndex);
+
+                                        // adjust index based on removal of item
+                                        endpointsIndex--;
+                                    }
+                                    else
+                                    {
+                                        endpointsToBeAddedTo[endpointsIndex].Locations = endpointLocations.ToArray();
+                                    }
+                                }
+                                else
+                                {
+                                    // Create new endpoint based on this endpoint, but with single location and regional AKS endpoint
+                                    var newEndpointForSpecificFeatureFlag = new ResourceProviderEndpoint()
+                                    {
+                                        Locations = new string[] { region },
+                                        EndpointUri = $"https://<endpointprefix>-{LocationToShortName[region]}.<endpointsuffix>",
+                                        RequiredFeatures = endpoint.RequiredFeatures,
+                                        Timeout = endpoint.Timeout,
+                                        Enabled = endpoint.Enabled,
+                                        ApiVersions = endpoint.ApiVersions,
+                                    };
+
+                                    // Add new endpoint for this specific feature flag
+                                    endpointsToBeAddedTo.Add(newEndpointForSpecificFeatureFlag);
+
+                                    // Update endpoint with this location removed
+                                    var endpointLocations = endpoint.Locations.ToList();
+                                    endpointLocations.Remove(region);
+
+                                    // If that was the only region in the endpoint, remove the whole endpoint. Otherwise update endpoint
+                                    if (endpointLocations.Count == 0)
+                                    {
+                                        var endpointatIndex = endpointsToBeAddedTo.ElementAt(endpointsIndex);
+                                        if (endpointatIndex.Locations.Length == 1 && !endpointatIndex.Locations.Contains(region))
+                                        {
+                                            Console.WriteLine("Deleting the endpoint with the wrong locations");
+                                        }
+
+                                        endpointsToBeAddedTo.RemoveAt(endpointsIndex);
+
+                                        // adjust index based on removal of item
+                                        endpointsIndex--;
+                                    }
+                                    else
+                                    {
+                                        endpointsToBeAddedTo[endpointsIndex].Locations = endpointLocations.ToArray();
+                                    }
+                                }
+                            }
+                        }
+
+                        endpointsIndex++;
+                    }
+
+                    foreach (var region in RegionsToCutover)
+                    {
+                        int aksEndpointIndex = endpointsToBeAddedTo.IndexOf(e => e.Locations.Contains(region) && e.RequiredFeatures != null && e.RequiredFeatures.Contains("Microsoft.HealthcareApis/TestEnvAKS"));
+
+                        if (aksEndpointIndex < 0)
+                        {
+                            continue;
+                        }
+
+                        // Remove AKS feature flag
+                        var features = endpointsToBeAddedTo[aksEndpointIndex].RequiredFeatures.ToList();
+                        features.Remove("Microsoft.HealthcareApis/<Put AKS Feature Flag here>");
+                        endpointsToBeAddedTo[aksEndpointIndex].RequiredFeatures = features.Count == 0 ? null : features.ToArray();
+                    }
+
+                    rt.Endpoints = endpointsToBeAddedTo.ToArray();
+                }
+
+                var serializer = SerializerSettings.SerializerMediaTypeSettings;
+                serializer.Formatting = Newtonsoft.Json.Formatting.Indented;
+                string json = JsonConvert.SerializeObject(manifest, serializer);
+
+                File.WriteAllText("prod2.json", json);
+            }
+        }
+        catch (IOException e)
+        {
+            Console.WriteLine("An error occurred while reading the file:");
+            Console.WriteLine(e.Message);
+        }
+        catch (Exception ex)
+        {
+            Console.WriteLine("An error occurred while reading the file:");
+            Console.WriteLine(ex.Message);
+        }
     }
 
     private static async Task UpdateManifestToAddRegionalEndpoints()
@@ -143,7 +326,7 @@ class Program
 
                     foreach (var regionToApiVersions in availableRegionsToApiVersions)
                     {
-                        string endpointUri = $"https://hcapisapi-{LocationToShortName[regionToApiVersions.Key]}.rp.azurehealthcareapis.com/providers/Microsoft.HealthcareApis/";
+                        string endpointUri = $"https://<endpointprefix>-{LocationToShortName[regionToApiVersions.Key]}.<endpointsuffix>";
                         if (rt.Endpoints.Any(rpe => rpe.EndpointUri == endpointUri))
                         {
                             // endpoint already exists

@@ -45,7 +45,27 @@ class Program
 
     private static List<string> RegionsToCutover = new List<string>()
     {
-        "West Central US", "East Asia", "Central US", "UK South", "Australia Central"
+        "East US 2",
+        "North Central US",
+        "South Central US",
+        "West US 2",
+        "West US 3",
+        "Southeast Asia",
+        "Australia East",
+        "Sweden Central",
+        "North Europe",
+        "West Europe",
+        "UK West",
+        "Brazil South",
+        "Canada Central",
+        "Central India",
+        "France Central",
+        "Germany West Central",
+        "Japan East",
+        "Switzerland North",
+        "Korea Central",
+        "Qatar Central",
+        "South Africa North"
     };
 
     private static List<string> DeprecatedRTs = new List<string>()
@@ -97,12 +117,14 @@ class Program
                     {
                         foreach (var region in RegionsToCutover)
                         {
-                            if (endpoint.RequiredFeatures != null && endpoint.RequiredFeatures.Length == 1 && endpoint.RequiredFeatures.Contains("Microsoft.HealthcareApis/<Put PreProd Feature Flag here>"))
+                            if (endpoint.RequiredFeatures != null && endpoint.RequiredFeatures.Length == 1 && (endpoint.RequiredFeatures.Contains("Microsoft.HealthcareApis/<Put PreProd Feature Flag here>") || endpoint.RequiredFeatures.Contains("Microsoft.HealthcareApis/<Put INT feature flag here>")))
                             {
                                 // skipping preprod routes since that environment does not exist in AKS
+                                // skipping int since it is already converted
                                 continue;
                             }
 
+                            // find the index of the AKS endpoint, if it is enabled in this region and still has a feature flag on it
                             int aksEndpointIndex = endpointsToBeAddedTo.IndexOf(e => e.Locations.Contains(region) && e.RequiredFeatures != null && e.RequiredFeatures.Contains("Microsoft.HealthcareApis/<Put AKS Feature Flag here>"));
 
                             if (aksEndpointIndex < 0)
@@ -113,7 +135,7 @@ class Program
 
                             // Get any additional feature flags declared on AKS endpoint
                             var aksFeatureFlagsAsideFromAksFF = endpointsToBeAddedTo[aksEndpointIndex].RequiredFeatures.ToList();
-                            aksFeatureFlagsAsideFromAksFF.Remove("Microsoft.HealthcareApis/<Put AKS Feature Flag here>");
+                            aksFeatureFlagsAsideFromAksFF.Remove("Microsoft.HealthcareApis/<Put AKS Feature Flag here>"); ;
 
                             if (endpoint.Locations == null || endpoint.Locations.Length == 0 || endpoint.Locations.Contains("") || aksEndpointIndex == endpointsIndex)
                             {
